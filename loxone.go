@@ -751,7 +751,7 @@ func (l *websocketImpl) handleReconnect() {
 			l.setConnected(false)
 			// if auto reconnect is disabled, close the stop channel and return immediately
 			if !l.autoReconnect {
-				close(l.stop)
+				l.Close()
 				return
 			}
 
@@ -794,9 +794,22 @@ func (l *websocketImpl) setConnected(connected bool) {
 func (l *websocketImpl) Close() {
 	l.safeStop.Do(func() {
 		close(l.stop)
-		_ = l.write(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		_ = l.socket.Close()
+		l.closeSocket()
 	})
+}
+
+func (l *websocketImpl) closeSocket() {
+	l.socketMu.Lock()
+	sock := l.socket
+	l.socketMu.Unlock()
+
+	if sock != nil {
+		_ = l.write(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		l.socketMu.Lock()
+		_ = l.socket.Close()
+		l.socketMu.Unlock()
+	}
+
 }
 
 func (l *websocketImpl) write(messageType int, data []byte) error {
@@ -804,6 +817,11 @@ func (l *websocketImpl) write(messageType int, data []byte) error {
 	// another option is to set up a write pump, we can't assume user isn't using goroutines to issue commands
 	l.socketMu.Lock()
 	defer l.socketMu.Unlock()
+
+	if l.socket == nil {
+		return errors.New("socket has not initiated yet")
+	}
+
 	return l.socket.WriteMessage(messageType, data)
 }
 

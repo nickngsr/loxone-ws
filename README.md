@@ -5,7 +5,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/XciD/loxone-ws)](https://goreportcard.com/report/github.com/XciD/loxone-ws)
 [![codecov](https://codecov.io/gh/XciD/loxone-ws/branch/master/graph/badge.svg)](https://codecov.io/gh/XciD/loxone-ws)
 
-
+TODO
   - ~~Loxone DNS~~
   - ~~Download Socket~~
   - ~~Version Check~~
