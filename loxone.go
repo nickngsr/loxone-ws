@@ -1017,7 +1017,7 @@ func (l *websocketImpl) sendSocketCmd(cmd *[]byte) (*websocketResponse, error) {
 	case result := <-l.callbackChannel:
 		log.Debugf("WS answered")
 		return result, nil
-	case <-time.After(3 * time.Second):
+	case <-time.After(l.connectionTimeout):
 		// this case is to cover disconnect during wait, we shouldn't get out of sync req/res because this should
 		// never happen unless the miniserver didn't handle the command
 		return nil, errors.New("command timeout")
