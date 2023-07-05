@@ -18,6 +18,7 @@ import (
 	"github.com/XciD/loxone-ws/crypto"
 	"github.com/XciD/loxone-ws/events"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/go-version"
 	"github.com/lestrrat-go/jwx/jwt"
@@ -204,20 +205,21 @@ type websocketImpl struct {
 	isConnected      bool
 	connectedHandler func(bool)
 
-	disconnected       chan bool
-	safeStop           sync.Once
-	stop               chan bool
-	hooks              map[string]func(events.Event)
-	registerEvents     bool
-	autoReconnect      bool
-	reconnectTimeout   time.Duration
-	socketMu           sync.Mutex
-	keepaliveInterval  time.Duration
-	connectionTimeout  time.Duration
-	miniserverMac      string
-	useTLS             bool
-	insecureSkipVerify bool
-	httpTransport      *http.Transport
+	disconnected                   chan bool
+	safeStop                       sync.Once
+	stop                           chan bool
+	hooks                          map[string]func(events.Event)
+	registerEvents                 bool
+	autoReconnect                  bool
+	stopAutoReconnectOnAuthFailure bool
+	reconnectTimeout               backoff.BackOff
+	socketMu                       sync.Mutex
+	keepaliveInterval              time.Duration
+	connectionTimeout              time.Duration
+	miniserverMac                  string
+	useTLS                         bool
+	insecureSkipVerify             bool
+	httpTransport                  *http.Transport
 
 	// Miniserver capabilities
 	httpsSupported uint8 // in jdev/cfg/apiKey response (httpsStatus: 1 Supported, 2 Supported but expired)
@@ -335,6 +337,13 @@ func WithAutoReconnect(autoReconnect bool) WebsocketOption {
 	}
 }
 
+func WithStopReconnectingOnAuthFailure(stop bool) WebsocketOption {
+	return func(ws *websocketImpl) error {
+		ws.stopAutoReconnectOnAuthFailure = stop
+		return nil
+	}
+}
+
 // WithKeepAliveInterval allows you to set the interval where keepalive messages are sent,
 // a duration of 0 disables keepalive. If not specified it will default to 2 seconds as per Loxone's own LxCommunicator.
 func WithKeepAliveInterval(keepAliveInterval time.Duration) WebsocketOption {
@@ -358,7 +367,35 @@ func WithConnectionTimeout(connectionTimeout time.Duration) WebsocketOption {
 // WithReconnectTimeout sets the time between disconnection and reconnect attempts
 func WithReconnectTimeout(timeout time.Duration) WebsocketOption {
 	return func(ws *websocketImpl) error {
-		ws.reconnectTimeout = timeout
+		if ws.reconnectTimeout != nil {
+			return errors.New("you can only specify one of 'WithReconnectExponentialBackoffTimeout' or 'WithReconnectTimeout'")
+		}
+		ws.reconnectTimeout = backoff.NewConstantBackOff(timeout)
+		return nil
+	}
+}
+
+// WithReconnectExponentialBackoffTimeout sets the time between disconnection and reconnect attempts using an exponential
+// backoff algorithm to increase the time between each reconnect until successfully reconnected. Specify a minimum and
+// maximum interval, each attempt will increase the wait time by 50%.
+func WithReconnectExponentialBackoffTimeout(initialInterval, maxInterval time.Duration) WebsocketOption {
+	return func(ws *websocketImpl) error {
+
+		if ws.reconnectTimeout != nil {
+			return errors.New("you can only specify one of 'WithReconnectExponentialBackoffTimeout' or 'WithReconnectTimeout'")
+		}
+
+		bo := &backoff.ExponentialBackOff{
+			InitialInterval:     initialInterval,
+			MaxInterval:         maxInterval,
+			RandomizationFactor: backoff.DefaultRandomizationFactor,
+			Multiplier:          backoff.DefaultMultiplier,
+			Stop:                backoff.Stop,
+			Clock:               backoff.SystemClock,
+		}
+		bo.Reset()
+
+		ws.reconnectTimeout = bo
 		return nil
 	}
 }
@@ -499,7 +536,6 @@ func New(opts ...WebsocketOption) (Loxone, error) {
 
 	// normal (non-download) socket defaults
 	loxone.autoReconnect = true
-	loxone.reconnectTimeout = 30 * time.Second
 	loxone.keepaliveInterval = 2 * time.Second
 
 	// Loop through each option
@@ -508,6 +544,10 @@ func New(opts ...WebsocketOption) (Loxone, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	if loxone.reconnectTimeout == nil {
+		loxone.reconnectTimeout = backoff.NewConstantBackOff(30 * time.Second)
 	}
 
 	if loxone.keepaliveInterval > 0 && loxone.connectionTimeout == 0 {
@@ -707,7 +747,11 @@ func (l *websocketImpl) connect() error {
 	err = l.authenticate()
 
 	if err != nil {
-		// if auth fails on a reconnect, there's no point in trying any more, assume password changed?
+		log.Errorf("Authentication failed: %s", err)
+		if l.stopAutoReconnectOnAuthFailure {
+			log.Error("Stopping reconnect due to user setting on auth failure")
+			l.Close()
+		}
 		return err
 	}
 
@@ -756,19 +800,23 @@ func (l *websocketImpl) handleReconnect() {
 			}
 
 			for {
-				log.Warnf("Disconnected, reconnecting in %s", l.reconnectTimeout)
+				backoffDuration := l.reconnectTimeout.NextBackOff()
+				log.Warnf("Disconnected, reconnecting in %s", backoffDuration)
 
 				// check for stop during reconnect loop
 				select {
 				case <-l.stop:
 					return
-				case <-time.After(l.reconnectTimeout):
+				case <-time.After(backoffDuration):
+
 					err := l.connect()
 
 					if err != nil {
 						log.Warnf("Error during reconnection, retrying (%s)", err.Error())
 						continue
 					}
+
+					l.reconnectTimeout.Reset()
 
 					return
 				}
@@ -785,7 +833,7 @@ func (l *websocketImpl) setConnected(connected bool) {
 	l.connectedMu.Lock()
 	l.isConnected = connected
 	if l.connectedHandler != nil {
-		l.connectedHandler(connected)
+		go l.connectedHandler(connected)
 	}
 	l.connectedMu.Unlock()
 }
@@ -807,6 +855,7 @@ func (l *websocketImpl) closeSocket() {
 		_ = l.write(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 		l.socketMu.Lock()
 		_ = l.socket.Close()
+		l.socket = nil
 		l.socketMu.Unlock()
 	}
 
@@ -964,9 +1013,15 @@ func (l *websocketImpl) sendSocketCmd(cmd *[]byte) (*websocketResponse, error) {
 	}
 
 	log.Debug("Waiting for answer")
-	result := <-l.callbackChannel
-	log.Debugf("WS answered")
-	return result, nil
+	select {
+	case result := <-l.callbackChannel:
+		log.Debugf("WS answered")
+		return result, nil
+	case <-time.After(3 * time.Second):
+		// this case is to cover disconnect during wait, we shouldn't get out of sync req/res because this should
+		// never happen unless the miniserver didn't handle the command
+		return nil, errors.New("command timeout")
+	}
 }
 
 func (l *websocketImpl) authenticate() error {
@@ -1020,9 +1075,9 @@ func (l *websocketImpl) authenticate() error {
 	if l.token != nil && l.token.IsValid() {
 		log.Debug("Token still valid, can attempt to re-use")
 
-		// TODO: check token really is valid
-
 		if err := l.reuseToken(string(oneTimeSalt)); err != nil {
+			// if token failed, remove it so we don't try again
+			l.token = nil
 			return err
 		}
 
@@ -1135,10 +1190,12 @@ func (l *websocketImpl) connectWs() error {
 	}
 
 	socket, _, err := dialer.Dial(u.String(), nil)
-	l.socket = socket
 	if err != nil {
 		return err
 	}
+	l.socketMu.Lock()
+	l.socket = socket
+	l.socketMu.Unlock()
 
 	go l.readPump()
 
