@@ -136,8 +136,6 @@ func InitBinaryEvent(bytes []byte, eventType EventType) *BinaryEvent {
 		binaryEvent.readEvent(bytes)
 	case EventTypeDaytimer:
 		// TODO
-	case EventTypeWeather:
-		// TODO
 	}
 
 	return binaryEvent

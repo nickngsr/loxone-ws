@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/XciD/loxone-ws/crypto"
@@ -40,7 +41,6 @@ const (
 	encryptionCommandAndResponse = "jdev/sys/fenc/%s"
 	registerEvents               = "jdev/sps/enablebinstatusupdate"
 	getConfig                    = "data/LoxAPP3.json"
-	MiniserverEpochOffset        = 1230768000
 )
 
 // Body response form command sent by ws
@@ -73,6 +73,8 @@ type Config struct {
 	Cats map[string]*Category
 	// Controls all the control of the loxone server
 	Controls map[string]*Control
+	// WeatherServer is present if the miniserver has a cloud weather license
+	WeatherServer *WeatherServer
 }
 
 func (cfg *Config) CatName(key interface{}) string {
@@ -97,6 +99,11 @@ func (cfg *Config) RoomName(key interface{}) string {
 		return ""
 	}
 	return room.Name
+}
+
+type WeatherServer struct {
+	States map[string]string `json:"states"`
+	// more to add
 }
 
 // Control represent a control
@@ -190,13 +197,17 @@ type Category struct {
 
 // Loxone The loxone object exposed
 type websocketImpl struct {
-	host            string
-	port            uint16
-	user            string
-	password        string
-	encrypt         *encrypt
-	token           *token
-	Events          chan events.Event
+	host     string
+	port     uint16
+	user     string
+	password string
+	encrypt  *encrypt
+	token    *token
+	events   chan events.Event
+
+	isListeningToWeatherEvents atomic.Bool
+	weatherEvents              chan events.WeatherEventTable
+
 	callbackChannel chan *websocketResponse
 	socketMessage   chan []byte
 	socket          *websocket.Conn
@@ -254,6 +265,7 @@ type LoxoneDownloadSocket interface {
 
 type Loxone interface {
 	GetEvents() <-chan events.Event
+	GetWeatherEventTableEvents() <-chan events.WeatherEventTable
 	Done() <-chan bool
 	AddHook(uuid string, callback func(events.Event))
 	SendCommand(command string, class interface{}) (*Body, error)
@@ -289,7 +301,7 @@ type token struct {
 }
 
 func (t *token) IsValid() bool {
-	epoch := t.ValidUntil + MiniserverEpochOffset - 30 // 30 second buffer before expiration
+	epoch := t.ValidUntil + events.LoxEpochOffset - 30 // 30 second buffer before expiration
 	validTil := time.Unix(epoch, 0)
 	return time.Now().Before(validTil)
 }
@@ -371,6 +383,14 @@ func WithReconnectTimeout(timeout time.Duration) WebsocketOption {
 			return errors.New("you can only specify one of 'WithReconnectExponentialBackoffTimeout' or 'WithReconnectTimeout'")
 		}
 		ws.reconnectTimeout = backoff.NewConstantBackOff(timeout)
+		return nil
+	}
+}
+
+// WithWeatherEvents will make the weather events channel block, so you don't miss the first events
+func WithWeatherEvents() WebsocketOption {
+	return func(ws *websocketImpl) error {
+		ws.isListeningToWeatherEvents.Store(true)
 		return nil
 	}
 }
@@ -484,7 +504,7 @@ func WithJWTToken(tokenString string) WebsocketOption {
 
 		exp := jwtToken.Expiration()
 		if !exp.IsZero() {
-			loxoneToken.ValidUntil = exp.Unix() - MiniserverEpochOffset
+			loxoneToken.ValidUntil = exp.Unix() - events.LoxEpochOffset
 		}
 
 		if rights, exists := jwtToken.Get("tokenRights"); exists {
@@ -517,7 +537,8 @@ func WithJWTToken(tokenString string) WebsocketOption {
 func newBase() *websocketImpl {
 	return &websocketImpl{
 		port:            80,
-		Events:          make(chan events.Event),
+		events:          make(chan events.Event),
+		weatherEvents:   make(chan events.WeatherEventTable),
 		callbackChannel: make(chan *websocketResponse),
 		disconnected:    make(chan bool, 1), // buffered in case reconnectHandler is already done (on close for example)
 		stop:            make(chan bool),
@@ -894,7 +915,12 @@ func (l *websocketImpl) AddHook(uuid string, callback func(events.Event)) {
 
 // GetEvents returns the events in a receive only channel
 func (l *websocketImpl) GetEvents() <-chan events.Event {
-	return l.Events
+	return l.events
+}
+
+func (l *websocketImpl) GetWeatherEventTableEvents() <-chan events.WeatherEventTable {
+	l.isListeningToWeatherEvents.Store(true)
+	return l.weatherEvents
 }
 
 // Done returns the stop channel to indicate the socket has been called to close
@@ -910,7 +936,7 @@ func (l *websocketImpl) PumpEvents(stop <-chan bool) {
 			case <-stop:
 				log.Infof("Shutting Down")
 				return
-			case event := <-l.Events:
+			case event := <-l.events:
 				if hook, ok := l.hooks[event.UUID]; ok {
 					hook(event)
 				}
@@ -1012,12 +1038,17 @@ func (l *websocketImpl) sendSocketCmd(cmd *[]byte) (*websocketResponse, error) {
 		return nil, err
 	}
 
+	// use timer instead of time.After() to ensure memory can be collected immediately
+	timeoutTimer := time.NewTimer(l.connectionTimeout)
+
 	log.Debug("Waiting for answer")
 	select {
 	case result := <-l.callbackChannel:
 		log.Debugf("WS answered")
+		// stop timer so it can be collected immediately
+		timeoutTimer.Stop()
 		return result, nil
-	case <-time.After(l.connectionTimeout):
+	case <-timeoutTimer.C:
 		// this case is to cover disconnect during wait, we shouldn't get out of sync req/res because this should
 		// never happen unless the miniserver didn't handle the command
 		return nil, errors.New("command timeout")
@@ -1304,7 +1335,8 @@ func (l *websocketImpl) handleMessages() {
 				case events.EventTypeDaytimer:
 					l.handleBinaryEvent(message, incomingData.EventType)
 				case events.EventTypeWeather:
-					l.handleBinaryEvent(message, incomingData.EventType)
+					//l.handleBinaryEvent(message, incomingData.EventType)
+					l.handleWeatherEvents(message)
 				default:
 					log.Warnf("Unknown event %d", incomingData.EventType)
 				}
@@ -1322,8 +1354,23 @@ func (l *websocketImpl) handleBinaryEvent(binaryEvent []byte, eventType events.E
 	e := events.InitBinaryEvent(binaryEvent, eventType)
 
 	for _, event := range e.Events {
-		l.Events <- event
+		l.events <- event
 	}
+}
+
+func (l *websocketImpl) handleWeatherEvents(data []byte) {
+
+	// don't want to block if the user isn't listening to weather events
+	if !l.isListeningToWeatherEvents.Load() {
+		return
+	}
+
+	tables := events.InitWeatherEventTable(data)
+
+	for _, table := range tables {
+		l.weatherEvents <- table
+	}
+
 }
 
 func (e *encrypt) hashUser(user string, password string, salt string, oneTimeSalt string, hashAlg HashAlg) string {
